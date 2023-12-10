@@ -1,6 +1,5 @@
 use std::error::Error;
 use std::fmt::Debug;
-use std::thread::{self};
 use std::time::Duration;
 use errors::KafkaCallerError;
 use io::messages::{CreateSerDe, SerDe, CreateRequest, ProcessResponse};
@@ -9,6 +8,7 @@ use kafka_protocol::messages::{ApiKey, ApiVersionsRequest, ApiVersionsResponse, 
 use kafka_protocol::protocol::{Decodable, Encodable, Message, HeaderVersion};
 use kafka_protocol::records::Record;
 use tokio::net::TcpStream;
+use tokio::task;
 use crate::io::call_state::CallState;
 use crate::io::IO;
 use crate::io::messages::fetch::ProcessFetchResponse;
@@ -94,8 +94,8 @@ impl Consumer {
         self.do_call::<SyncGroupRequest, SyncGroupResponse>(ApiKey::SyncGroupKey).await?;
         // heartbeat works and returns error_code 0, so is probably correct for this simple use-case.
         // however it sends static data (with exception of correlation id) to simplify implementation
-        // by not having to make part of CallSate thread safe
-        //self.run_heartbeat()?;
+        // by not having to make part of CallState thread safe
+        //self.run_heartbeat().await?;
         self.do_call::<OffsetFetchRequest, OffsetFetchResponse>(ApiKey::OffsetFetchKey).await?;
         self.do_call::<ListOffsetsRequest, ListOffsetsResponse>(ApiKey::ListOffsetsKey).await?;
         let result = self.do_call_fetch().await?;
@@ -158,20 +158,22 @@ impl Consumer {
         // this comes from different trait than other process_response methods - it returns vector of records besides modifying state
         response_body.process_response(&mut self.state)
     }
-/*
+
     #[allow(dead_code)]
     // this is a super-naive implementation that sends fixed request data to avoid having to make parts of CallState thread-safe
-    fn run_heartbeat(&self) -> Result<(), Box<dyn Error>>  {
-        let mut heartbeat_io = self.io.try_clone()?;
+    async fn run_heartbeat(&self) -> Result<(), Box<dyn Error>> {
+        let mut heartbeat_io = self.io.with_cloned_arc();
         let ser_de: SerDe<HeartbeatRequest, HeartbeatResponse> = ApiKey::HeartbeatKey.new_ser_de(Some(&self.state)).unwrap();
         let request_body = HeartbeatRequest::default().create_request(&self.state)?;
         let atomic = self.state.correlation_id.clone();
         let client_id = self.state.configuration.client_id().clone();
 
-        thread::spawn(move || {
-            loop {
-                thread::sleep(Duration::from_millis(5000));
+        let mut heartbeat_interval = tokio::time::interval(Duration::from_millis(5000));
 
+        let heartbeat = task::spawn(async move {
+            loop {
+                heartbeat_interval.tick().await;
+                
                 let request_body = request_body.clone();
 
                 println!("{:#?}", request_body);
@@ -183,7 +185,7 @@ impl Consumer {
                                     atomic.fetch_add(1, std::sync::atomic::Ordering::Relaxed), 
                                     request_body
                                 ).unwrap()
-                    ).unwrap();
+                    ).await.unwrap();
 
                 let (_, response_body) = ser_de.deserialize(&mut response_bytes).unwrap();
 
@@ -191,8 +193,10 @@ impl Consumer {
             }
         });
 
+        heartbeat.await?;
+
         Ok(())
-    } */
+    }
 } 
 
 pub struct Producer {
