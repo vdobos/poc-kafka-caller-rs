@@ -170,8 +170,8 @@ impl Consumer {
 
         let mut heartbeat_interval = tokio::time::interval(Duration::from_millis(5000));
 
-        let heartbeat = task::spawn(async move {
-            loop {
+        task::spawn(async move {
+           loop {
                 heartbeat_interval.tick().await;
                 
                 let request_body = request_body.clone();
@@ -192,8 +192,6 @@ impl Consumer {
                 println!("{:#?}", response_body);
             }
         });
-
-        heartbeat.await?;
 
         Ok(())
     }
