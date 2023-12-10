@@ -1,3 +1,4 @@
+#[cfg(test)]
 use crate::{Configuration, Consumer, Producer, io::records::PutRecord};
 
 #[tokio::test]
