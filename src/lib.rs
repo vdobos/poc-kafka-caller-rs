@@ -1,6 +1,5 @@
 use std::error::Error;
 use std::fmt::Debug;
-use std::net::TcpStream;
 use std::thread::{self};
 use std::time::Duration;
 use errors::KafkaCallerError;
@@ -9,6 +8,7 @@ use io::records::{PutRecord, extract_topics};
 use kafka_protocol::messages::{ApiKey, ApiVersionsRequest, ApiVersionsResponse, MetadataRequest, MetadataResponse, FindCoordinatorRequest, FindCoordinatorResponse, JoinGroupRequest, JoinGroupResponse, FetchRequest, FetchResponse, SyncGroupRequest, SyncGroupResponse, OffsetFetchRequest, OffsetFetchResponse, ListOffsetsRequest, ListOffsetsResponse, OffsetCommitRequest, OffsetCommitResponse, LeaveGroupRequest, LeaveGroupResponse, HeartbeatRequest, HeartbeatResponse, InitProducerIdRequest, InitProducerIdResponse, ProduceRequest, ProduceResponse};
 use kafka_protocol::protocol::{Decodable, Encodable, Message, HeaderVersion};
 use kafka_protocol::records::Record;
+use tokio::net::TcpStream;
 use crate::io::call_state::CallState;
 use crate::io::IO;
 use crate::io::messages::fetch::ProcessFetchResponse;
@@ -53,9 +53,9 @@ pub struct Consumer {
 }
 
 impl Consumer {
-    pub fn new(configuration: &Configuration) -> Result<Self, Box<dyn Error>> {
+    pub async fn new(configuration: &Configuration) -> Result<Self, Box<dyn Error>> {
         if let Configuration::ConsumerConfiguration{broker_address, ..} = configuration {
-            let tcp_stream = TcpStream::connect(broker_address)?;
+            let tcp_stream = TcpStream::connect(broker_address).await?;
 
             Ok(
                 Self {
@@ -83,31 +83,31 @@ impl Consumer {
     // polls even on subsequent calls, however these are probably not entirely correct, as it no longer fully matches java client.
     // Theoretically, implementation should handle poll from multiple topics and multiple partitions(on one broker only), but that remains untested.
     // (there are more calls by java client in practice, especially several ApiVersions calls, but this is enough to correctly poll entries)
-    pub fn first_poll(&mut self) -> Result<Vec<Record>, Box<dyn Error>> {
-        self.do_call::<ApiVersionsRequest, ApiVersionsResponse>(ApiKey::ApiVersionsKey)?;
-        self.do_call::<MetadataRequest, MetadataResponse>(ApiKey::MetadataKey)?;
-        self.do_call::<FindCoordinatorRequest, FindCoordinatorResponse>(ApiKey::FindCoordinatorKey)?;
+    pub async fn first_poll(&mut self) -> Result<Vec<Record>, Box<dyn Error>> {
+        self.do_call::<ApiVersionsRequest, ApiVersionsResponse>(ApiKey::ApiVersionsKey).await?;
+        self.do_call::<MetadataRequest, MetadataResponse>(ApiKey::MetadataKey).await?;
+        self.do_call::<FindCoordinatorRequest, FindCoordinatorResponse>(ApiKey::FindCoordinatorKey).await?;
         // first join group returns member id, second performs proper join group
-        self.do_call::<JoinGroupRequest, JoinGroupResponse>(ApiKey::JoinGroupKey)?;
-        self.do_call::<JoinGroupRequest, JoinGroupResponse>(ApiKey::JoinGroupKey)?;
+        self.do_call::<JoinGroupRequest, JoinGroupResponse>(ApiKey::JoinGroupKey).await?;
+        self.do_call::<JoinGroupRequest, JoinGroupResponse>(ApiKey::JoinGroupKey).await?;
         // sync group is called because otherwise heartbeat returns error
-        self.do_call::<SyncGroupRequest, SyncGroupResponse>(ApiKey::SyncGroupKey)?;
+        self.do_call::<SyncGroupRequest, SyncGroupResponse>(ApiKey::SyncGroupKey).await?;
         // heartbeat works and returns error_code 0, so is probably correct for this simple use-case.
         // however it sends static data (with exception of correlation id) to simplify implementation
         // by not having to make part of CallSate thread safe
         //self.run_heartbeat()?;
-        self.do_call::<OffsetFetchRequest, OffsetFetchResponse>(ApiKey::OffsetFetchKey)?;
-        self.do_call::<ListOffsetsRequest, ListOffsetsResponse>(ApiKey::ListOffsetsKey)?;
-        let result = self.do_call_fetch()?;
+        self.do_call::<OffsetFetchRequest, OffsetFetchResponse>(ApiKey::OffsetFetchKey).await?;
+        self.do_call::<ListOffsetsRequest, ListOffsetsResponse>(ApiKey::ListOffsetsKey).await?;
+        let result = self.do_call_fetch().await?;
         if !result.is_empty() {
-            self.do_call::<OffsetCommitRequest, OffsetCommitResponse>(ApiKey::OffsetCommitKey)?;  
+            self.do_call::<OffsetCommitRequest, OffsetCommitResponse>(ApiKey::OffsetCommitKey).await?;  
         };
-        self.do_call::<LeaveGroupRequest, LeaveGroupResponse>(ApiKey::LeaveGroupKey)?;
+        self.do_call::<LeaveGroupRequest, LeaveGroupResponse>(ApiKey::LeaveGroupKey).await?;
  
         Ok(result)
     }
 
-    fn do_call<Req, Res>(&mut self, api_key: ApiKey) -> Result<(), Box<dyn Error>>
+    async fn do_call<Req, Res>(&mut self, api_key: ApiKey) -> Result<(), Box<dyn Error>>
         where
             Req: Debug + Encodable + Decodable + Default + Message + HeaderVersion + CreateRequest<Req>,
             Res: Debug + Encodable + Decodable + Default + Message + HeaderVersion + ProcessResponse<Res>
@@ -124,7 +124,7 @@ impl Consumer {
                 self.state.correlation_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed),  
                 request_body
             )?
-        )?;
+        ).await?;
 
         let (_, response_body) = ser_de.deserialize(&mut response_bytes)?;
 
@@ -136,7 +136,7 @@ impl Consumer {
     }
 
     // this is separate because this one returns vector and also response implements different trait
-    fn do_call_fetch(&mut self) -> Result<Vec<Record>, Box<dyn Error>> {
+    async fn do_call_fetch(&mut self) -> Result<Vec<Record>, Box<dyn Error>> {
         let ser_de: SerDe<FetchRequest, FetchResponse> = ApiKey::FetchKey.new_ser_de(Some(&self.state))?;
 
         let request_body = FetchRequest::default().create_request(&self.state)?;
@@ -149,7 +149,7 @@ impl Consumer {
                 self.state.correlation_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed),  
                 request_body
             )?
-        )?;
+        ).await?;
 
         let (_, response_body) = ser_de.deserialize(&mut response_bytes)?;
 
@@ -158,7 +158,7 @@ impl Consumer {
         // this comes from different trait than other process_response methods - it returns vector of records besides modifying state
         response_body.process_response(&mut self.state)
     }
-
+/*
     #[allow(dead_code)]
     // this is a super-naive implementation that sends fixed request data to avoid having to make parts of CallState thread-safe
     fn run_heartbeat(&self) -> Result<(), Box<dyn Error>>  {
@@ -192,8 +192,8 @@ impl Consumer {
         });
 
         Ok(())
-    }
-}
+    } */
+} 
 
 pub struct Producer {
     state: CallState,
@@ -201,9 +201,9 @@ pub struct Producer {
 }
 
 impl Producer {
-    pub fn new(configuration: &Configuration) -> Result<Self, Box<dyn Error>> {
+    pub async fn new(configuration: &Configuration) -> Result<Self, Box<dyn Error>> {
         if let Configuration::ProducerConfiguration{broker_address, ..} = configuration {
-            let tcp_stream = TcpStream::connect(broker_address)?;
+            let tcp_stream = TcpStream::connect(broker_address).await?;
 
             Ok(
                 Self {
@@ -221,20 +221,20 @@ impl Producer {
     // Put works correctly, even on repeated calls, however this is probably not entirely correct, as it does not fully match java client
     // when performing more than one call. Put theoretically supports multiple topics (each having one partition, and one broker only), but that remains untested.
     // (there are more calls performed by java client in practice, especially several ApiVersions calls, but this is enough to correctly put entries)
-    pub fn put(&mut self, records: &mut Vec<PutRecord>) -> Result<(), Box<dyn Error>> {
+    pub async fn put(&mut self, records: &mut Vec<PutRecord>) -> Result<(), Box<dyn Error>> {
         self.state.connected_topics = extract_topics(records);
         self.state.records_to_send.append(records);
 
-        self.do_call::<ApiVersionsRequest, ApiVersionsResponse>(ApiKey::ApiVersionsKey)?;
-        self.do_call::<MetadataRequest, MetadataResponse>(ApiKey::MetadataKey)?;
-        self.do_call::<InitProducerIdRequest, InitProducerIdResponse>(ApiKey::InitProducerIdKey)?;
+        self.do_call::<ApiVersionsRequest, ApiVersionsResponse>(ApiKey::ApiVersionsKey).await?;
+        self.do_call::<MetadataRequest, MetadataResponse>(ApiKey::MetadataKey).await?;
+        self.do_call::<InitProducerIdRequest, InitProducerIdResponse>(ApiKey::InitProducerIdKey).await?;
         
-        let result = self.do_call::<ProduceRequest, ProduceResponse>(ApiKey::ProduceKey);
+        let result = self.do_call::<ProduceRequest, ProduceResponse>(ApiKey::ProduceKey).await;
         self.state.records_to_send.clear();
         result
     }
 
-    fn do_call<Req, Res>(&mut self, api_key: ApiKey) -> Result<(), Box<dyn Error>>
+    async fn do_call<Req, Res>(&mut self, api_key: ApiKey) -> Result<(), Box<dyn Error>>
         where
             Req: Debug + Encodable + Decodable + Default + Message + HeaderVersion + CreateRequest<Req>,
             Res: Debug + Encodable + Decodable + Default + Message + HeaderVersion + ProcessResponse<Res>
@@ -251,7 +251,7 @@ impl Producer {
                 self.state.correlation_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed),  
                 request_body
             )?
-        )?;
+        ).await?;
 
         let (_, response_body) = ser_de.deserialize(&mut response_bytes)?;
 
